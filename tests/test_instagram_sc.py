@@ -1,7 +1,10 @@
 """Tests for instagram.py — ScrapeCreators Instagram search module."""
 
+import io
+import json
 import os
 import unittest
+import urllib.error
 from urllib.parse import parse_qs, urlsplit
 from unittest.mock import MagicMock, patch
 
@@ -174,6 +177,24 @@ class TestSearchRetryOn500(unittest.TestCase):
 class TestGoogleSearchFallback(unittest.TestCase):
     """The Google-indexed post lane recovers when reels search is empty."""
 
+    @staticmethod
+    def _no_reels_error():
+        from lib import http as http_module
+
+        return http_module.HTTPError(
+            "HTTP 404: Not Found",
+            404,
+            json.dumps({
+                "success": False,
+                "error": "not_found",
+                "errorStatus": 404,
+                "message": (
+                    "No reels found for that query. "
+                    "You were not charged for this request."
+                ),
+            }),
+        )
+
     def _post_payload(self):
         return {
             "data": {
@@ -260,6 +281,87 @@ class TestGoogleSearchFallback(unittest.TestCase):
 
         self.assertEqual([], result["items"])
         self.assertIn("404", result["error"])
+
+    def test_documented_404_no_reels_is_clean_empty_after_google_fallback(self):
+        from lib import http as http_module
+
+        with patch.object(
+            http_module,
+            "get",
+            side_effect=[self._no_reels_error(), {"results": []}],
+        ) as mock_http_get:
+            result = instagram.search_instagram(
+                "unknown niche topic", "2026-08-01", "2026-08-31",
+                depth="quick", token="fake-token",
+            )
+
+        self.assertEqual({"items": []}, result)
+        self.assertEqual(2, mock_http_get.call_count)
+
+    def test_documented_404_no_reels_is_not_captured_as_source_failure(self):
+        from lib import http as http_module
+
+        error_response = urllib.error.HTTPError(
+            "https://api.scrapecreators.com/v2/instagram/reels/search",
+            404,
+            "Not Found",
+            {},
+            io.BytesIO(self._no_reels_error().body.encode("utf-8")),
+        )
+        google_response = MagicMock()
+        google_response.status = 200
+        google_response.read.return_value = b'{"results": []}'
+        google_response.__enter__.return_value = google_response
+        google_response.__exit__.return_value = False
+
+        with patch(
+            "lib.http.urllib.request.urlopen",
+            side_effect=[error_response, google_response],
+        ):
+            with http_module.capture_failures() as failures:
+                result = instagram.search_instagram(
+                    "unknown niche topic", "2026-08-01", "2026-08-31",
+                    depth="quick", token="fake-token",
+                )
+
+        self.assertEqual({"items": []}, result)
+        self.assertEqual([], failures)
+
+    def test_404_with_other_not_found_message_remains_error(self):
+        from lib import http as http_module
+
+        outage = http_module.HTTPError(
+            "HTTP 404: Not Found", 404,
+            json.dumps({"error": "not_found", "message": "Instagram reels endpoint removed"}),
+        )
+        with patch.object(
+            http_module, "get", side_effect=[outage, {"results": []}]
+        ):
+            result = instagram.search_instagram(
+                "unknown niche topic", "2026-08-01", "2026-08-31",
+                depth="quick", token="fake-token",
+            )
+
+        self.assertEqual([], result["items"])
+        self.assertIn("404", result["error"])
+
+    def test_no_reels_404_after_hashtag_retry_is_clean_empty(self):
+        from lib import http as http_module
+
+        with patch.object(
+            http_module, "get",
+            side_effect=[
+                http_module.HTTPError("HTTP 500: Server Error", 500, ""),
+                self._no_reels_error(),
+                {"results": []},
+            ],
+        ):
+            result = instagram.search_instagram(
+                "niche topic", "2026-08-01", "2026-08-31",
+                depth="quick", token="fake-token",
+            )
+
+        self.assertEqual({"items": []}, result)
 
     def test_404_is_preserved_when_google_search_fails(self):
         from lib import http as http_module

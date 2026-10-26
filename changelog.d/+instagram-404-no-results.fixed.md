@@ -1,0 +1,1 @@
+Classify ScrapeCreators Instagram reels-search 404 responses that explicitly report no matching reels as clean no-results, while preserving errors for other 404s and keeping Google discovery fallback. Fixes the Instagram portion of #1311.
