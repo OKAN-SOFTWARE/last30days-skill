@@ -126,20 +126,13 @@ def _get_reels_search(
     deadline: float | None,
     cancel: threading.Event | None,
 ) -> dict[str, Any]:
-    """Search reels without recording a documented empty match as a failure."""
-    with http.tee_failures() as failures:
-        try:
-            return http.get(
-                f"{SCRAPECREATORS_BASE}/v2/instagram/reels/search",
-                params={"query": query},
-                headers=http.scrapecreators_headers(token),
-                retries=2,
-                **_request_options(30, deadline, cancel),
-            )
-        except http.HTTPError as error:
-            if _is_no_reels_found_404(error):
-                failures[:] = [failure for failure in failures if failure is not error]
-            raise
+    return http.get(
+        f"{SCRAPECREATORS_BASE}/v2/instagram/reels/search",
+        params={"query": query},
+        headers=http.scrapecreators_headers(token),
+        retries=2,
+        **_request_options(30, deadline, cancel),
+    )
 
 
 def expand_instagram_queries(topic: str, depth: str) -> List[str]:
@@ -580,40 +573,48 @@ def search_instagram(
     _log(f"Searching Instagram for '{core_topic}' (depth={depth}, count={config['results_per_page']})")
 
     primary_error = None
-    try:
-        data = _get_reels_search(core_topic, token, deadline, cancel)
-    except http.HTTPError as e:
-        # SC's v2 reels search wraps Google Search and 500s frequently on
-        # multi-token queries. Single tokens hit the stable hashtag-page
-        # path. Retry once with hashtag form before bubbling up.
-        if (getattr(e, "status_code", None) == 500 and ' ' in core_topic
-                and not _budget_expired(deadline, cancel)):
-            _log(f"IG search 500 on '{core_topic}', retrying with hashtag form")
-            try:
-                data = _get_reels_search(_to_hashtag_form(core_topic), token, deadline, cancel)
-            except Exception as retry_e:
-                if (
-                    isinstance(retry_e, http.HTTPError)
-                    and getattr(retry_e, "status_code", None) == 404
-                ):
-                    if not _is_no_reels_found_404(retry_e):
-                        primary_error = retry_e
-                    data = {"reels": []}
+    superseded_failures: list[http.HTTPError] = []
+    with http.tee_failures() as reels_failures:
+        try:
+            data = _get_reels_search(core_topic, token, deadline, cancel)
+        except http.HTTPError as e:
+            # SC's v2 reels search wraps Google Search and 500s frequently on
+            # multi-token queries. Single tokens hit the stable hashtag-page
+            # path. Retry once with hashtag form before bubbling up.
+            if (getattr(e, "status_code", None) == 500 and ' ' in core_topic
+                    and not _budget_expired(deadline, cancel)):
+                _log(f"IG search 500 on '{core_topic}', retrying with hashtag form")
+                try:
+                    data = _get_reels_search(_to_hashtag_form(core_topic), token, deadline, cancel)
+                    superseded_failures.append(e)
+                except Exception as retry_e:
+                    if (
+                        isinstance(retry_e, http.HTTPError)
+                        and getattr(retry_e, "status_code", None) == 404
+                    ):
+                        if _is_no_reels_found_404(retry_e):
+                            superseded_failures += [e, retry_e]
+                        else:
+                            primary_error = retry_e
+                        data = {"reels": []}
+                    else:
+                        _log(f"IG search retry failed: {retry_e}")
+                        return {"items": [], "error": f"{type(retry_e).__name__}: {retry_e}"}
+            elif getattr(e, "status_code", None) == 404:
+                # Only the documented no-results payload is a clean miss. Other
+                # 404s remain errors if the independent Google fallback is empty.
+                if _is_no_reels_found_404(e):
+                    superseded_failures.append(e)
                 else:
-                    _log(f"IG search retry failed: {retry_e}")
-                    return {"items": [], "error": f"{type(retry_e).__name__}: {retry_e}"}
-        elif getattr(e, "status_code", None) == 404:
-            # Only the documented no-results payload is a clean miss. Other
-            # 404s remain errors if the independent Google fallback is empty.
-            if not _is_no_reels_found_404(e):
-                primary_error = e
-            data = {"reels": []}
-        else:
+                    primary_error = e
+                data = {"reels": []}
+            else:
+                _log(f"ScrapeCreators error: {e}")
+                return {"items": [], "error": f"{type(e).__name__}: {e}"}
+        except Exception as e:
             _log(f"ScrapeCreators error: {e}")
             return {"items": [], "error": f"{type(e).__name__}: {e}"}
-    except Exception as e:
-        _log(f"ScrapeCreators error: {e}")
-        return {"items": [], "error": f"{type(e).__name__}: {e}"}
+        reels_failures[:] = [f for f in reels_failures if f not in superseded_failures]
 
     # Items are in the 'reels' array (ScrapeCreators v2 response)
     raw_items = data.get("reels") or data.get("items") or data.get("data") or []

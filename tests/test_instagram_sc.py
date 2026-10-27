@@ -298,31 +298,43 @@ class TestGoogleSearchFallback(unittest.TestCase):
         self.assertEqual({"items": []}, result)
         self.assertEqual(2, mock_http_get.call_count)
 
-    def test_documented_404_no_reels_is_not_captured_as_source_failure(self):
+    @staticmethod
+    def _http_response(status, body):
+        response = MagicMock()
+        response.status = status
+        response.read.return_value = body
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        return response
+
+    def _search_with_captured_failures(self, topic, reels_responses):
+        """Run a search over the real transport; reels_responses maps query -> (status, body)."""
         from lib import http as http_module
 
-        error_response = urllib.error.HTTPError(
-            "https://api.scrapecreators.com/v2/instagram/reels/search",
-            404,
-            "Not Found",
-            {},
-            io.BytesIO(self._no_reels_error().body.encode("utf-8")),
-        )
-        google_response = MagicMock()
-        google_response.status = 200
-        google_response.read.return_value = b'{"results": []}'
-        google_response.__enter__.return_value = google_response
-        google_response.__exit__.return_value = False
+        def urlopen(request, *args, **kwargs):
+            url = request.full_url
+            if "/reels/search" not in url:
+                return self._http_response(200, b'{"results": []}')
+            query = parse_qs(urlsplit(url).query)["query"][0]
+            status, body = reels_responses[query]
+            if status == 200:
+                return self._http_response(200, body)
+            raise urllib.error.HTTPError(url, status, "Error", {}, io.BytesIO(body))
 
-        with patch(
-            "lib.http.urllib.request.urlopen",
-            side_effect=[error_response, google_response],
-        ):
+        with patch("lib.http.urllib.request.urlopen", side_effect=urlopen), \
+                patch("lib.http.time.sleep"):
             with http_module.capture_failures() as failures:
                 result = instagram.search_instagram(
-                    "unknown niche topic", "2026-08-01", "2026-08-31",
+                    topic, "2026-08-01", "2026-08-31",
                     depth="quick", token="fake-token",
                 )
+        return result, failures
+
+    def test_documented_404_no_reels_is_not_captured_as_source_failure(self):
+        no_reels = self._no_reels_error().body.encode("utf-8")
+        result, failures = self._search_with_captured_failures(
+            "unknown niche topic", {"unknown niche topic": (404, no_reels)},
+        )
 
         self.assertEqual({"items": []}, result)
         self.assertEqual([], failures)
@@ -345,23 +357,27 @@ class TestGoogleSearchFallback(unittest.TestCase):
         self.assertEqual([], result["items"])
         self.assertIn("404", result["error"])
 
-    def test_no_reels_404_after_hashtag_retry_is_clean_empty(self):
-        from lib import http as http_module
+    def test_hashtag_retry_answer_clears_the_500_it_replaced(self):
+        no_reels = self._no_reels_error().body.encode("utf-8")
+        for retry_response in [(404, no_reels), (200, b'{"reels": []}')]:
+            with self.subTest(retry_status=retry_response[0]):
+                result, failures = self._search_with_captured_failures(
+                    "niche topic",
+                    {"niche topic": (500, b"{}"), "nichetopic": retry_response},
+                )
 
-        with patch.object(
-            http_module, "get",
-            side_effect=[
-                http_module.HTTPError("HTTP 500: Server Error", 500, ""),
-                self._no_reels_error(),
-                {"results": []},
-            ],
-        ):
-            result = instagram.search_instagram(
-                "niche topic", "2026-08-01", "2026-08-31",
-                depth="quick", token="fake-token",
-            )
+                self.assertEqual({"items": []}, result)
+                self.assertEqual([], failures)
 
-        self.assertEqual({"items": []}, result)
+    def test_500_stays_captured_when_hashtag_retry_also_fails(self):
+        result, failures = self._search_with_captured_failures(
+            "niche topic",
+            {"niche topic": (500, b"{}"), "nichetopic": (500, b"{}")},
+        )
+
+        self.assertEqual([], result["items"])
+        self.assertIn("500", result["error"])
+        self.assertEqual([500, 500], [f.status_code for f in failures])
 
     def test_404_is_preserved_when_google_search_fails(self):
         from lib import http as http_module
